@@ -1,0 +1,65 @@
+name: 📚 Documentation Issue
+description: Report an issue with documentation or request documentation improvements
+title: "[DOCS] "
+labels: ["documentation", "needs-triage"]
+assignees: ["franorzabal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve our documentation!
+
+  - type: input
+    id: linear-issue
+    attributes:
+      label: Linear Issue
+      description: If this relates to a Linear issue, please provide the ID (e.g., FRA-43)
+      placeholder: "FRA-XXX"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: doc-type
+    attributes:
+      label: Documentation Type
+      description: What type of documentation issue is this?
+      options:
+        - Missing Documentation
+        - Incorrect Documentation
+        - Outdated Documentation
+        - Unclear Documentation
+        - Documentation Enhancement
+    validations:
+      required: true
+
+  - type: input
+    id: doc-location
+    attributes:
+      label: Documentation Location
+      description: Which file or section needs attention?
+      placeholder: "e.g., README.md, scripts/start-development.sh, .github/workflows/"
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue-description
+    attributes:
+      label: Issue Description
+      description: Describe the documentation issue
+      placeholder: What's wrong or missing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggested-improvement
+    attributes:
+      label: Suggested Improvement
+      description: How would you improve this documentation?
+      placeholder: What changes would you suggest?
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context about the documentation issue
+      placeholder: Screenshots, examples, links, etc.

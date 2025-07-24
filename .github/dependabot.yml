@@ -1,0 +1,166 @@
+# Dependabot configuration for automated dependency updates
+# This file should be placed at .github/dependabot.yml
+
+version: 2
+updates:
+  # Python dependencies
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "franorzabal"
+    assignees:
+      - "franorzabal"
+    labels:
+      - "dependencies"
+      - "python"
+      - "security"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    # Group related updates
+    groups:
+      security-updates:
+        patterns:
+          - "bandit*"
+          - "safety*"
+          - "semgrep*"
+        update-types:
+          - "minor"
+          - "patch"
+      testing-dependencies:
+        patterns:
+          - "pytest*"
+          - "*test*"
+        update-types:
+          - "minor"
+          - "patch"
+      development-dependencies:
+        patterns:
+          - "black"
+          - "isort"
+          - "flake8"
+          - "mypy"
+        update-types:
+          - "minor"
+          - "patch"
+    # Ignore specific packages if needed
+    ignore:
+      # Example: ignore major version updates for critical packages
+      - dependency-name: "requests"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/.github/workflows"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "franorzabal"
+    assignees:
+      - "franorzabal"
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "ci-cd"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    # Group GitHub Actions updates
+    groups:
+      github-actions:
+        patterns:
+          - "actions/*"
+          - "github/*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Docker dependencies (if Dockerfiles are added)
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "11:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 2
+    reviewers:
+      - "franorzabal"
+    assignees:
+      - "franorzabal"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "security"
+    commit-message:
+      prefix: "docker"
+      include: "scope"
+
+  # NPM dependencies (if package.json is added)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "franorzabal"
+    assignees:
+      - "franorzabal"
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "npm"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    groups:
+      development-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+      security-updates:
+        patterns:
+          - "*security*"
+          - "*audit*"
+        update-types:
+          - "patch"
+          - "minor"
+          - "major"
+    ignore:
+      # Ignore major updates for Node.js-related packages by default
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+# Global configuration for all package ecosystems
+# Enable security updates for all ecosystems
+enable-beta-ecosystems: true
+
+# Auto-merge configuration (can be set per ecosystem)
+# Note: This requires branch protection rules to be properly configured
+auto-merge:
+  # Auto-merge patch updates for security tools
+  - package-ecosystem: "pip"
+    dependency-name: "bandit"
+    update-types: ["version-update:semver-patch"]
+  - package-ecosystem: "pip" 
+    dependency-name: "safety"
+    update-types: ["version-update:semver-patch"]
+  - package-ecosystem: "github-actions"
+    dependency-name: "actions/*"
+    update-types: ["version-update:semver-patch"]

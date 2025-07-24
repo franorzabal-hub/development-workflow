@@ -1,0 +1,69 @@
+name: ❓ Question
+description: Ask a question about the development workflow
+title: "[QUESTION] "
+labels: ["question", "needs-triage"]
+assignees: ["franorzabal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about the development workflow? We're here to help!
+
+  - type: input
+    id: linear-issue
+    attributes:
+      label: Related Linear Issue
+      description: If this question relates to a Linear issue, please provide the ID (e.g., FRA-43)
+      placeholder: "FRA-XXX"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: question-category
+    attributes:
+      label: Question Category
+      description: What is your question about?
+      options:
+        - Setup and Installation
+        - Script Usage
+        - GitHub Actions
+        - Linear Integration
+        - Troubleshooting
+        - Best Practices
+        - Configuration
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+      description: What would you like to know?
+      placeholder: Ask your question here...
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Provide any relevant context for your question
+      placeholder: What are you trying to accomplish? What have you tried?
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment (if relevant)
+      description: Your environment details
+      value: |
+        - OS: [e.g. macOS, Ubuntu, Windows]
+        - Shell: [e.g. bash, zsh, fish]
+        - Python Version: [e.g. 3.11]
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: Additional Information
+      description: Any other information that might be helpful
+      placeholder: Screenshots, error messages, configuration files, etc.

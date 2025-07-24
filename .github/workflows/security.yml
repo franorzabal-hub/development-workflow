@@ -1,0 +1,503 @@
+name: 🛡️ Security Scanning & Compliance
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of security scan to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'code_analysis'
+          - 'dependency_check'
+          - 'secrets_scan'
+          - 'container_scan'
+      severity_threshold:
+        description: 'Minimum severity to report'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - 'low'
+          - 'medium'
+          - 'high'
+          - 'critical'
+
+env:
+  SCAN_TYPE: ${{ github.event.inputs.scan_type || 'all' }}
+  SEVERITY_THRESHOLD: ${{ github.event.inputs.severity_threshold || 'medium' }}
+
+jobs:
+  codeql-analysis:
+    name: 🔍 CodeQL Analysis
+    runs-on: ubuntu-latest
+    if: contains(fromJson('["all", "code_analysis"]'), env.SCAN_TYPE)
+    
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python', 'javascript' ]
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 🔍 Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+          
+      - name: 🏗️ Autobuild
+        uses: github/codeql-action/autobuild@v2
+        
+      - name: 🔍 Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:${{matrix.language}}"
+
+  dependency-security:
+    name: 📦 Dependency Security Scan
+    runs-on: ubuntu-latest
+    if: contains(fromJson('["all", "dependency_check"]'), env.SCAN_TYPE)
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: 📦 Install security tools
+        run: |
+          pip install safety pip-audit bandit[toml]
+          
+      - name: 🔍 Safety dependency scan
+        run: |
+          echo "🔍 Running Safety dependency scan..."
+          
+          if [ -f requirements.txt ]; then
+            echo "📋 Scanning requirements.txt..."
+            safety check -r requirements.txt --json --output safety-report.json || true
+            safety check -r requirements.txt || echo "⚠️ Vulnerabilities found in requirements.txt"
+          fi
+          
+          if [ -f requirements-dev.txt ]; then
+            echo "📋 Scanning requirements-dev.txt..."
+            safety check -r requirements-dev.txt || echo "⚠️ Vulnerabilities found in requirements-dev.txt"
+          fi
+          
+          # Check currently installed packages
+          echo "📋 Scanning installed packages..."
+          safety check --json --output safety-installed.json || true
+          safety check || echo "⚠️ Vulnerabilities found in installed packages"
+          
+      - name: 🕵️ Pip-audit scan
+        run: |
+          echo "🕵️ Running pip-audit scan..."
+          
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --format=json --output=pip-audit-report.json || true
+            pip-audit -r requirements.txt || echo "⚠️ pip-audit found vulnerabilities"
+          fi
+          
+      - name: 🛡️ Advanced dependency analysis
+        run: |
+          echo "🛡️ Running advanced dependency analysis..."
+          
+          # Check for outdated packages
+          if [ -f requirements.txt ]; then
+            echo "📊 Checking for outdated packages..."
+            pip list --outdated --format=json > outdated-packages.json
+            
+            OUTDATED_COUNT=$(jq length outdated-packages.json)
+            echo "📊 Found $OUTDATED_COUNT outdated packages"
+            
+            if [ $OUTDATED_COUNT -gt 0 ]; then
+              echo "📋 Outdated packages:"
+              jq -r '.[] | "\(.name): \(.version) -> \(.latest_version)"' outdated-packages.json
+            fi
+          fi
+          
+          # License check
+          echo "📄 Checking package licenses..."
+          pip install pip-licenses
+          pip-licenses --format=json --output-file=licenses.json
+          
+          # Check for restrictive licenses
+          RESTRICTIVE_LICENSES='["GPL", "AGPL", "LGPL"]'
+          echo "$RESTRICTIVE_LICENSES" | jq -r '.[]' | while read license; do
+            if jq -e --arg lic "$license" '.[] | select(.License | contains($lic))' licenses.json >/dev/null; then
+              echo "⚠️ Found packages with restrictive license: $license"
+              jq -r --arg lic "$license" '.[] | select(.License | contains($lic)) | "\(.Name): \(.License)"' licenses.json
+            fi
+          done
+          
+      - name: 📋 Upload dependency reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-security-reports
+          path: |
+            safety-report.json
+            safety-installed.json
+            pip-audit-report.json
+            outdated-packages.json
+            licenses.json
+
+  secrets-scan:
+    name: 🔐 Secrets Scanning
+    runs-on: ubuntu-latest
+    if: contains(fromJson('["all", "secrets_scan"]'), env.SCAN_TYPE)
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for better secret detection
+          
+      - name: 🔐 Install secret scanning tools
+        run: |
+          # Install gitleaks
+          wget -O gitleaks.tar.gz https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_*_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          
+      - name: 🔍 Gitleaks secret scan
+        run: |
+          echo "🔍 Running Gitleaks secret scan..."
+          
+          # Scan for secrets in entire repository history
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json --verbose || true
+          
+          # Display results
+          if [ -s gitleaks-report.json ]; then
+            echo "🚨 Secrets found:"
+            cat gitleaks-report.json | jq '.[] | {file: .File, secret: .Secret[0:20], rule: .RuleID}'
+            
+            SECRET_COUNT=$(jq length gitleaks-report.json)
+            echo "🚨 Total secrets found: $SECRET_COUNT"
+            
+            if [ $SECRET_COUNT -gt 0 ]; then
+              echo "❌ Security scan failed due to secrets"
+              exit 1
+            fi
+          else
+            echo "✅ No secrets found"
+          fi
+          
+      - name: 🔍 Custom secret patterns
+        run: |
+          echo "🔍 Scanning for custom secret patterns..."
+          
+          # Custom patterns for common secrets
+          SECRET_PATTERNS=(
+            "LINEAR_API_KEY.*lin_api_[a-zA-Z0-9]+"
+            "GITHUB_TOKEN.*gh[ps]_[a-zA-Z0-9]{36}"
+            "AWS_ACCESS_KEY_ID.*AKIA[0-9A-Z]{16}"
+            "SLACK_TOKEN.*xox[baprs]-[0-9a-zA-Z]+"
+            "DISCORD_TOKEN.*[MN][A-Za-z\d]{23}\.[A-Za-z\d]{6}\.[A-Za-z\d]{27}"
+          )
+          
+          SECRETS_FOUND=false
+          
+          for pattern in "${SECRET_PATTERNS[@]}"; do
+            echo "Checking pattern: $pattern"
+            if grep -r -E "$pattern" . --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=venv 2>/dev/null; then
+              echo "🚨 Found potential secret matching pattern: $pattern"
+              SECRETS_FOUND=true
+            fi
+          done
+          
+          if [ "$SECRETS_FOUND" = true ]; then
+            echo "❌ Custom secret scan failed"
+            exit 1
+          else
+            echo "✅ No custom secrets found"
+          fi
+          
+      - name: 🔍 Environment variable validation
+        run: |
+          echo "🔍 Validating environment variable usage..."
+          
+          # Check for hardcoded values that should be environment variables
+          HARDCODED_PATTERNS=(
+            "lin_api_[a-zA-Z0-9]+"
+            "gh[ps]_[a-zA-Z0-9]{36}"
+            "https://hooks.slack.com/services/"
+            "https://discord.com/api/webhooks/"
+          )
+          
+          HARDCODED_FOUND=false
+          
+          for pattern in "${HARDCODED_PATTERNS[@]}"; do
+            if grep -r -E "$pattern" . --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=venv 2>/dev/null; then
+              echo "⚠️ Found hardcoded value that should be an environment variable: $pattern"
+              HARDCODED_FOUND=true
+            fi
+          done
+          
+          if [ "$HARDCODED_FOUND" = true ]; then
+            echo "⚠️ Found hardcoded values (review recommended)"
+          else
+            echo "✅ No hardcoded values found"
+          fi
+          
+      - name: 📋 Upload secrets reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: secrets-scan-reports
+          path: |
+            gitleaks-report.json
+
+  code-security:
+    name: 🧪 Code Security Analysis
+    runs-on: ubuntu-latest
+    if: contains(fromJson('["all", "code_analysis"]'), env.SCAN_TYPE)
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: 📦 Install security analysis tools
+        run: |
+          pip install bandit[toml] semgrep
+          
+      - name: 🛡️ Bandit security scan
+        run: |
+          echo "🛡️ Running Bandit security scan..."
+          
+          # Create bandit config if it doesn't exist
+          if [ ! -f pyproject.toml ] && [ ! -f .bandit ]; then
+            cat > .bandit << EOF
+[bandit]
+exclude_dirs = ["/tests", "/venv", "/.git"]
+skips = ["B101", "B601"]  # Skip assert and shell injection (if needed)
+EOF
+          fi
+          
+          if find . -name "*.py" -not -path "./venv/*" | grep -q .; then
+            bandit -r . -f json -o bandit-report.json || true
+            bandit -r . || true
+            
+            # Parse results
+            if [ -f bandit-report.json ]; then
+              HIGH_ISSUES=$(jq '.metrics._totals."SEVERITY.HIGH" // 0' bandit-report.json)
+              MEDIUM_ISSUES=$(jq '.metrics._totals."SEVERITY.MEDIUM" // 0' bandit-report.json)
+              LOW_ISSUES=$(jq '.metrics._totals."SEVERITY.LOW" // 0' bandit-report.json)
+              
+              echo "📊 Bandit Results:"
+              echo "High: $HIGH_ISSUES, Medium: $MEDIUM_ISSUES, Low: $LOW_ISSUES"
+              
+              # Fail on high severity issues
+              if [ $HIGH_ISSUES -gt 0 ]; then
+                echo "❌ High severity security issues found"
+                jq '.results[] | select(.issue_severity == "HIGH")' bandit-report.json
+                exit 1
+              fi
+            fi
+          else
+            echo "ℹ️ No Python files found for Bandit scan"
+            echo '{"metrics": {"_totals": {"SEVERITY.HIGH": 0}}, "results": []}' > bandit-report.json
+          fi
+          
+      - name: 🔍 Semgrep security scan
+        run: |
+          echo "🔍 Running Semgrep security scan..."
+          
+          # Run semgrep with security rules
+          semgrep --config=auto --json --output=semgrep-report.json . || true
+          semgrep --config=auto . || echo "⚠️ Semgrep found potential issues"
+          
+          # Parse results
+          if [ -f semgrep-report.json ]; then
+            CRITICAL_COUNT=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep-report.json)
+            WARNING_COUNT=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep-report.json)
+            
+            echo "📊 Semgrep Results:"
+            echo "Critical: $CRITICAL_COUNT, Warnings: $WARNING_COUNT"
+            
+            # Fail on critical issues
+            if [ $CRITICAL_COUNT -gt 0 ]; then
+              echo "❌ Critical security issues found"
+              jq '.results[] | select(.extra.severity == "ERROR")' semgrep-report.json
+              exit 1
+            fi
+          fi
+          
+      - name: 🔒 Shell script security check
+        run: |
+          echo "🔒 Checking shell script security..."
+          
+          if command -v shellcheck >/dev/null 2>&1; then
+            find . -name "*.sh" -not -path "./venv/*" | while read script; do
+              echo "Checking $script..."
+              shellcheck "$script" || echo "⚠️ ShellCheck found issues in $script"
+            done
+          else
+            echo "⚠️ ShellCheck not available, installing..."
+            sudo apt-get update && sudo apt-get install -y shellcheck
+            
+            find . -name "*.sh" -not -path "./venv/*" | while read script; do
+              echo "Checking $script..."
+              shellcheck "$script" || echo "⚠️ ShellCheck found issues in $script"
+            done
+          fi
+          
+      - name: 📋 Upload code security reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-security-reports
+          path: |
+            bandit-report.json
+            semgrep-report.json
+
+  container-security:
+    name: 🐳 Container Security
+    runs-on: ubuntu-latest
+    if: contains(fromJson('["all", "container_scan"]'), env.SCAN_TYPE)
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 🐳 Check for Dockerfiles
+        id: docker_check
+        run: |
+          if find . -name "Dockerfile*" -o -name "*.dockerfile" | grep -q .; then
+            echo "dockerfiles_found=true" >> $GITHUB_OUTPUT
+            echo "✅ Found Dockerfiles to scan"
+          else
+            echo "dockerfiles_found=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No Dockerfiles found, skipping container scan"
+          fi
+          
+      - name: 🛡️ Install container security tools
+        if: steps.docker_check.outputs.dockerfiles_found == 'true'
+        run: |
+          # Install trivy
+          sudo apt-get update
+          sudo apt-get install wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy
+          
+      - name: 🔍 Dockerfile security scan
+        if: steps.docker_check.outputs.dockerfiles_found == 'true'
+        run: |
+          echo "🔍 Scanning Dockerfiles for security issues..."
+          
+          find . -name "Dockerfile*" -o -name "*.dockerfile" | while read dockerfile; do
+            echo "Scanning $dockerfile..."
+            
+            # Trivy filesystem scan for Dockerfile
+            trivy fs --security-checks vuln,config "$dockerfile" || true
+            
+            # Basic Dockerfile best practices check
+            echo "Checking best practices for $dockerfile..."
+            
+            # Check for FROM scratch or FROM alpine (good)
+            if grep -q "FROM scratch\|FROM alpine" "$dockerfile"; then
+              echo "✅ Using minimal base image"
+            elif grep -q "FROM ubuntu\|FROM debian\|FROM centos" "$dockerfile"; then
+              echo "⚠️ Using full OS base image (consider alpine or scratch)"
+            fi
+            
+            # Check for USER instruction
+            if grep -q "^USER " "$dockerfile"; then
+              echo "✅ Non-root user specified"
+            else
+              echo "⚠️ No USER instruction found (will run as root)"
+            fi
+            
+            # Check for COPY/ADD with specific permissions
+            if grep -q "COPY.*--chown\|ADD.*--chown" "$dockerfile"; then
+              echo "✅ Using --chown with COPY/ADD"
+            else
+              echo "ℹ️ Consider using --chown with COPY/ADD instructions"
+            fi
+            
+            echo "---"
+          done
+
+  compliance-check:
+    name: 📋 Compliance & Policy Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 📋 Check required security files
+        run: |
+          echo "📋 Checking for required security files..."
+          
+          REQUIRED_FILES=(
+            "SECURITY.md"
+            ".github/SECURITY.md"
+            "CODE_OF_CONDUCT.md"
+            ".github/CODE_OF_CONDUCT.md"
+          )
+          
+          SECURITY_FILE_FOUND=false
+          CODE_OF_CONDUCT_FOUND=false
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ Found: $file"
+              if [[ "$file" == *"SECURITY.md" ]]; then
+                SECURITY_FILE_FOUND=true
+              fi
+              if [[ "$file" == *"CODE_OF_CONDUCT.md" ]]; then
+                CODE_OF_CONDUCT_FOUND=true
+              fi
+            fi
+          done
+          
+          if [ "$SECURITY_FILE_FOUND" = false ]; then
+            echo "⚠️ No SECURITY.md file found"
+          fi
+          
+          if [ "$CODE_OF_CONDUCT_FOUND" = false ]; then
+            echo "⚠️ No CODE_OF_CONDUCT.md file found"
+          fi
+          
+      - name: 🔒 Check branch protection compliance
+        run: |
+          echo "🔒 Checking branch protection compliance..."
+          
+          # This would typically use GitHub API to check branch protection rules
+          # For now, we'll just document what should be checked
+          
+          echo "📋 Branch Protection Checklist:"
+          echo "- [ ] Require pull request reviews"
+          echo "- [ ] Require status checks to pass"
+          echo "- [ ] Require branches to be up to date"
+          echo "- [ ] Require conversation resolution"
+          echo "- [ ] Restrict pushes to main/master"
+          echo "- [ ] Allow force pushes: disabled"
+          echo "- [ ] Allow deletions: disabled"
