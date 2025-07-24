@@ -1,0 +1,483 @@
+name: Linear ↔ GitHub Sync
+# Bidirectional synchronization between Linear and GitHub
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened, assigned, unassigned, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request:
+    types: [opened, edited, closed, reopened, assigned, unassigned, labeled, unlabeled, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  push:
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      sync_direction:
+        description: 'Sync direction (linear_to_github, github_to_linear, bidirectional)'
+        required: false
+        default: 'bidirectional'
+        type: choice
+        options:
+          - linear_to_github
+          - github_to_linear
+          - bidirectional
+      force_sync:
+        description: 'Force sync even if already synchronized'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  LINEAR_WEBHOOK_SECRET: ${{ secrets.LINEAR_WEBHOOK_SECRET }}
+
+jobs:
+  sync-linear-github:
+    name: 🔄 Sync Linear ↔ GitHub
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv PyGithub python-dateutil
+      
+      - name: 🔐 Validate API Keys
+        run: |
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "❌ LINEAR_API_KEY is not set"
+            exit 1
+          fi
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "❌ GITHUB_TOKEN is not set"
+            exit 1
+          fi
+          echo "✅ API keys validated"
+      
+      - name: 🔄 Execute Linear-GitHub Sync
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          import json
+          import requests
+          from datetime import datetime, timedelta
+          from typing import Dict, List, Any, Optional
+          import re
+          import time
+          
+          # Simple GitHub API client (avoiding external dependencies)
+          class GitHubClient:
+              def __init__(self, token: str, repo: str):
+                  self.token = token
+                  self.repo = repo
+                  self.base_url = "https://api.github.com"
+                  self.headers = {
+                      "Authorization": f"token {token}",
+                      "Accept": "application/vnd.github.v3+json"
+                  }
+              
+              def get_issues(self, state="all"):
+                  """Get repository issues."""
+                  url = f"{self.base_url}/repos/{self.repo}/issues"
+                  params = {"state": state, "per_page": 100}
+                  
+                  response = requests.get(url, headers=self.headers, params=params)
+                  response.raise_for_status()
+                  return response.json()
+              
+              def create_issue(self, title: str, body: str, labels: List[str] = None):
+                  """Create a new issue."""
+                  url = f"{self.base_url}/repos/{self.repo}/issues"
+                  data = {
+                      "title": title,
+                      "body": body,
+                      "labels": labels or []
+                  }
+                  
+                  response = requests.post(url, headers=self.headers, json=data)
+                  response.raise_for_status()
+                  return response.json()
+              
+              def update_issue(self, issue_number: int, title: str = None, body: str = None, state: str = None, labels: List[str] = None):
+                  """Update an existing issue."""
+                  url = f"{self.base_url}/repos/{self.repo}/issues/{issue_number}"
+                  data = {}
+                  
+                  if title is not None:
+                      data["title"] = title
+                  if body is not None:
+                      data["body"] = body
+                  if state is not None:
+                      data["state"] = state
+                  if labels is not None:
+                      data["labels"] = labels
+                  
+                  response = requests.patch(url, headers=self.headers, json=data)
+                  response.raise_for_status()
+                  return response.json()
+          
+          class LinearGitHubSync:
+              def __init__(self):
+                  self.linear_api_key = os.getenv("LINEAR_API_KEY")
+                  self.github_token = os.getenv("GITHUB_TOKEN")
+                  self.repo_name = os.getenv("GITHUB_REPOSITORY")
+                  self.sync_direction = os.getenv("INPUT_SYNC_DIRECTION", "bidirectional")
+                  self.force_sync = os.getenv("INPUT_FORCE_SYNC", "false").lower() == "true"
+                  
+                  # Initialize GitHub client
+                  self.github = GitHubClient(self.github_token, self.repo_name)
+                  
+                  # Linear API endpoints
+                  self.linear_api_url = "https://api.linear.app/graphql"
+                  self.linear_headers = {
+                      "Authorization": f"Bearer {self.linear_api_key}",
+                      "Content-Type": "application/json"
+                  }
+                  
+                  print(f"🔄 Initializing sync with direction: {self.sync_direction}")
+                  print(f"📂 Repository: {self.repo_name}")
+                  print(f"🔧 Force sync: {self.force_sync}")
+              
+              def execute_linear_query(self, query: str, variables: Dict = None) -> Dict:
+                  """Execute GraphQL query against Linear API."""
+                  payload = {"query": query}
+                  if variables:
+                      payload["variables"] = variables
+                  
+                  try:
+                      response = requests.post(
+                          self.linear_api_url,
+                          headers=self.linear_headers,
+                          json=payload,
+                          timeout=30
+                      )
+                      response.raise_for_status()
+                      return response.json()
+                  except Exception as e:
+                      print(f"❌ Linear API error: {e}")
+                      return {"errors": [{"message": str(e)}]}
+              
+              def get_linear_issues(self, team_key: str = None) -> List[Dict]:
+                  """Get Linear issues."""
+                  query = """
+                  query GetIssues($first: Int, $filter: IssueFilter) {
+                      issues(first: $first, filter: $filter) {
+                          nodes {
+                              id
+                              identifier
+                              title
+                              description
+                              priority
+                              priorityLabel
+                              state {
+                                  id
+                                  name
+                                  type
+                              }
+                              assignee {
+                                  id
+                                  name
+                                  email
+                              }
+                              labels {
+                                  nodes {
+                                      id
+                                      name
+                                      color
+                                  }
+                              }
+                              project {
+                                  id
+                                  name
+                              }
+                              team {
+                                  id
+                                  key
+                                  name
+                              }
+                              url
+                              createdAt
+                              updatedAt
+                              gitBranchName
+                          }
+                      }
+                  }
+                  """
+                  
+                  variables = {"first": 50}
+                  if team_key:
+                      variables["filter"] = {"team": {"key": {"eq": team_key}}}
+                  
+                  result = self.execute_linear_query(query, variables)
+                  
+                  if "errors" in result:
+                      print(f"❌ Failed to get Linear issues: {result['errors']}")
+                      return []
+                  
+                  return result.get("data", {}).get("issues", {}).get("nodes", [])
+              
+              def extract_linear_id_from_github(self, issue) -> Optional[str]:
+                  """Extract Linear issue ID from GitHub issue."""
+                  # Check title for Linear issue identifier
+                  title = issue.get("title", "")
+                  title_match = re.search(r'\[([A-Z]+-\d+)\]', title)
+                  if title_match:
+                      return title_match.group(1)
+                  
+                  # Check body for Linear URL or identifier
+                  body = issue.get("body", "") or ""
+                  url_match = re.search(r'linear\.app/[^/]+/issue/([A-Z]+-\d+)', body)
+                  if url_match:
+                      return url_match.group(1)
+                  
+                  id_match = re.search(r'Linear Issue: ([A-Z]+-\d+)', body)
+                  if id_match:
+                      return id_match.group(1)
+                  
+                  return None
+              
+              def extract_github_issue_from_linear(self, linear_issue: Dict) -> Optional[int]:
+                  """Extract GitHub issue number from Linear issue."""
+                  description = linear_issue.get("description", "") or ""
+                  
+                  # Look for GitHub issue references
+                  github_match = re.search(r'github\.com/[^/]+/[^/]+/issues/(\d+)', description)
+                  if github_match:
+                      return int(github_match.group(1))
+                  
+                  issue_match = re.search(r'GitHub Issue: #(\d+)', description)
+                  if issue_match:
+                      return int(issue_match.group(1))
+                  
+                  return None
+              
+              def sync_linear_to_github(self):
+                  """Sync Linear issues to GitHub."""
+                  print("🔄 Syncing Linear → GitHub")
+                  
+                  linear_issues = self.get_linear_issues()
+                  github_issues = self.github.get_issues()
+                  github_issues_dict = {issue["number"]: issue for issue in github_issues}
+                  
+                  synced_count = 0
+                  created_count = 0
+                  updated_count = 0
+                  
+                  for linear_issue in linear_issues:
+                      try:
+                          linear_id = linear_issue["identifier"]
+                          
+                          # Check if already linked to GitHub issue
+                          github_issue_num = self.extract_github_issue_from_linear(linear_issue)
+                          github_issue = github_issues_dict.get(github_issue_num) if github_issue_num else None
+                          
+                          # Find by Linear ID in GitHub issue titles/bodies
+                          if not github_issue:
+                              for gh_issue in github_issues:
+                                  if self.extract_linear_id_from_github(gh_issue) == linear_id:
+                                      github_issue = gh_issue
+                                      break
+                          
+                          if github_issue:
+                              # Update existing GitHub issue
+                              self.update_github_issue(github_issue, linear_issue)
+                              updated_count += 1
+                          else:
+                              # Create new GitHub issue
+                              new_issue = self.create_github_issue(linear_issue)
+                              if new_issue:
+                                  created_count += 1
+                          
+                          synced_count += 1
+                          
+                      except Exception as e:
+                          print(f"❌ Failed to sync Linear issue {linear_issue.get('identifier')}: {e}")
+                  
+                  print(f"✅ Linear → GitHub sync completed: {synced_count} synced, {created_count} created, {updated_count} updated")
+              
+              def create_github_issue(self, linear_issue: Dict):
+                  """Create GitHub issue from Linear issue."""
+                  try:
+                      linear_id = linear_issue["identifier"]
+                      title = f"[{linear_id}] {linear_issue['title']}"
+                      
+                      # Build description
+                      description_parts = [
+                          f"**Linear Issue:** [{linear_id}]({linear_issue['url']})",
+                          "",
+                          "**Priority:** " + (linear_issue.get('priorityLabel') or 'None'),
+                          "**State:** " + linear_issue.get('state', {}).get('name', 'Unknown'),
+                          ""
+                      ]
+                      
+                      if linear_issue.get('assignee'):
+                          description_parts.append(f"**Assignee:** {linear_issue['assignee']['name']}")
+                          description_parts.append("")
+                      
+                      if linear_issue.get('project'):
+                          description_parts.append(f"**Project:** {linear_issue['project']['name']}")
+                          description_parts.append("")
+                      
+                      if linear_issue.get('description'):
+                          description_parts.extend(["**Description:**", linear_issue['description']])
+                      
+                      body = "\\n".join(description_parts)
+                      
+                      # Create labels
+                      labels = []
+                      if linear_issue.get('priorityLabel'):
+                          labels.append(f"priority:{linear_issue['priorityLabel'].lower()}")
+                      if linear_issue.get('state', {}).get('name'):
+                          labels.append(f"linear:{linear_issue['state']['name'].lower().replace(' ', '-')}")
+                      if linear_issue.get('team', {}).get('key'):
+                          labels.append(f"team:{linear_issue['team']['key'].lower()}")
+                      
+                      # Add Linear labels
+                      for label in linear_issue.get('labels', {}).get('nodes', []):
+                          labels.append(label['name'].lower().replace(' ', '-'))
+                      
+                      # Create issue
+                      issue = self.github.create_issue(title=title, body=body, labels=labels)
+                      
+                      print(f"✅ Created GitHub issue #{issue['number']} for {linear_id}")
+                      
+                      # Update Linear issue with GitHub link
+                      self.update_linear_issue_with_github_link(linear_issue, issue['number'])
+                      
+                      return issue
+                      
+                  except Exception as e:
+                      print(f"❌ Failed to create GitHub issue for {linear_issue.get('identifier')}: {e}")
+                      return None
+              
+              def update_github_issue(self, github_issue, linear_issue: Dict):
+                  """Update GitHub issue with Linear issue data."""
+                  try:
+                      linear_id = linear_issue["identifier"]
+                      new_title = f"[{linear_id}] {linear_issue['title']}"
+                      
+                      # Check if update is needed
+                      current_title = github_issue.get("title", "")
+                      if current_title == new_title and not self.force_sync:
+                          return  # No update needed
+                      
+                      # Update GitHub issue
+                      self.github.update_issue(
+                          issue_number=github_issue["number"],
+                          title=new_title
+                      )
+                      
+                      print(f"✅ Updated GitHub issue #{github_issue['number']} for {linear_id}")
+                      
+                  except Exception as e:
+                      print(f"❌ Failed to update GitHub issue #{github_issue.get('number')}: {e}")
+              
+              def update_linear_issue_with_github_link(self, linear_issue: Dict, github_issue_number: int):
+                  """Update Linear issue with GitHub issue link."""
+                  try:
+                      issue_id = linear_issue["id"]
+                      github_url = f"https://github.com/{self.repo_name}/issues/{github_issue_number}"
+                      
+                      current_description = linear_issue.get("description", "") or ""
+                      
+                      # Check if GitHub link already exists
+                      if f"GitHub Issue: #{github_issue_number}" in current_description:
+                          return  # Already linked
+                      
+                      # Add GitHub link to description
+                      updated_description = current_description + f"\\n\\n**GitHub Issue:** [#{github_issue_number}]({github_url})"
+                      
+                      mutation = """
+                      mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
+                          issueUpdate(id: $id, input: $input) {
+                              success
+                              issue {
+                                  id
+                                  identifier
+                              }
+                          }
+                      }
+                      """
+                      
+                      variables = {
+                          "id": issue_id,
+                          "input": {
+                              "description": updated_description
+                          }
+                      }
+                      
+                      result = self.execute_linear_query(mutation, variables)
+                      
+                      if "errors" in result:
+                          print(f"❌ Failed to update Linear issue {linear_issue['identifier']}: {result['errors']}")
+                      else:
+                          print(f"✅ Updated Linear issue {linear_issue['identifier']} with GitHub link")
+                      
+                  except Exception as e:
+                      print(f"❌ Failed to update Linear issue with GitHub link: {e}")
+              
+              def run_sync(self):
+                  """Execute the synchronization based on configured direction."""
+                  try:
+                      print(f"🚀 Starting Linear ↔ GitHub synchronization")
+                      print(f"📅 Timestamp: {datetime.now().isoformat()}")
+                      
+                      if self.sync_direction in ["linear_to_github", "bidirectional"]:
+                          self.sync_linear_to_github()
+                      
+                      if self.sync_direction in ["github_to_linear", "bidirectional"]:
+                          print("ℹ️ GitHub → Linear sync not implemented in this version")
+                          # self.sync_github_to_linear()  # Would be implemented here
+                      
+                      print("✅ Synchronization completed successfully!")
+                      
+                  except Exception as e:
+                      print(f"❌ Synchronization failed: {e}")
+                      sys.exit(1)
+          
+          # Execute synchronization
+          if __name__ == "__main__":
+              sync = LinearGitHubSync()
+              sync.run_sync()
+          EOF
+        env:
+          LINEAR_API_KEY: ${{ env.LINEAR_API_KEY }}
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          INPUT_SYNC_DIRECTION: ${{ github.event.inputs.sync_direction }}
+          INPUT_FORCE_SYNC: ${{ github.event.inputs.force_sync }}
+      
+      - name: 📊 Generate Sync Summary
+        if: always()
+        run: |
+          echo "## 🔄 Linear ↔ GitHub Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** \`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Sync Direction:** \`${{ github.event.inputs.sync_direction || 'bidirectional' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Force Sync:** \`${{ github.event.inputs.force_sync || 'false' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** \`$(date -u)\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Sync Status" >> $GITHUB_STEP_SUMMARY
+          echo "The synchronization workflow has completed. Check the logs above for detailed results." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Useful Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Linear Workspace](https://linear.app)" >> $GITHUB_STEP_SUMMARY
+          echo "- [GitHub Issues](https://github.com/${{ github.repository }}/issues)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Workflow Runs](https://github.com/${{ github.repository }}/actions)" >> $GITHUB_STEP_SUMMARY
