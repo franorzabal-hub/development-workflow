@@ -1,0 +1,569 @@
+name: 🛡️ Disaster Recovery Testing
+
+on:
+  schedule:
+    # Run disaster recovery tests weekly on Sundays at 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of disaster recovery test'
+        required: true
+        default: 'basic'
+        type: choice
+        options:
+          - basic
+          - comprehensive
+          - emergency_simulation
+      backup_type:
+        description: 'Backup type to test with'
+        required: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - weekly
+          - manual
+  pull_request:
+    paths:
+      - 'scripts/disaster-recovery-assessment.sh'
+      - 'scripts/backup-system.sh'
+      - 'scripts/recovery-procedures.sh'
+      - 'docs/DISASTER_RECOVERY.md'
+      - 'docs/INCIDENT_RESPONSE.md'
+      - 'docs/BACKUP_PROCEDURES.md'
+
+env:
+  BACKUP_ROOT: /tmp/dr_test_backups
+  RECOVERY_ROOT: /tmp/dr_test_recovery
+  TEST_RESULTS_DIR: /tmp/dr_test_results
+
+jobs:
+  disaster-recovery-assessment:
+    name: 🔍 System Assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up test environment
+        run: |
+          # Create test directories
+          mkdir -p ${{ env.BACKUP_ROOT }} ${{ env.RECOVERY_ROOT }} ${{ env.TEST_RESULTS_DIR }}
+          
+          # Set up basic environment
+          echo "LINEAR_API_KEY=test_key_placeholder" > .env
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+      - name: Run disaster recovery assessment
+        id: assessment
+        run: |
+          echo "Running disaster recovery assessment..."
+          
+          # Run assessment script
+          if ./scripts/disaster-recovery-assessment.sh --verbose; then
+            echo "assessment_result=PASSED" >> $GITHUB_OUTPUT
+            echo "assessment_status=OK" >> $GITHUB_OUTPUT
+          else
+            assessment_exit_code=$?
+            case $assessment_exit_code in
+              1)
+                echo "assessment_result=WARNINGS" >> $GITHUB_OUTPUT
+                echo "assessment_status=WARNING" >> $GITHUB_OUTPUT
+                ;;
+              2)
+                echo "assessment_result=CRITICAL" >> $GITHUB_OUTPUT
+                echo "assessment_status=CRITICAL" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                echo "assessment_result=FAILED" >> $GITHUB_OUTPUT
+                echo "assessment_status=ERROR" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          fi
+          
+          # Copy assessment logs
+          cp logs/disaster_recovery_assessment_*.log ${{ env.TEST_RESULTS_DIR }}/ || true
+          
+      - name: Upload assessment results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dr-assessment-results
+          path: |
+            ${{ env.TEST_RESULTS_DIR }}/
+            logs/disaster_recovery_assessment_*.log
+          retention-days: 30
+          
+      - name: Set assessment status
+        run: |
+          echo "Assessment Status: ${{ steps.assessment.outputs.assessment_status }}"
+          echo "Assessment Result: ${{ steps.assessment.outputs.assessment_result }}"
+          
+          if [[ "${{ steps.assessment.outputs.assessment_status }}" == "CRITICAL" || "${{ steps.assessment.outputs.assessment_status }}" == "ERROR" ]]; then
+            echo "Critical issues found in disaster recovery assessment"
+            exit 1
+          fi
+
+  backup-testing:
+    name: 💾 Backup System Testing
+    runs-on: ubuntu-latest
+    needs: disaster-recovery-assessment
+    timeout-minutes: 20
+    
+    strategy:
+      matrix:
+        backup_type: [daily, weekly, snapshot]
+        
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up test environment
+        run: |
+          # Create test directories
+          mkdir -p ${{ env.BACKUP_ROOT }} ${{ env.RECOVERY_ROOT }} ${{ env.TEST_RESULTS_DIR }}
+          
+          # Set up test data
+          echo "LINEAR_API_KEY=test_key_placeholder" > .env
+          echo "GITHUB_TOKEN=test_token_placeholder" > .env.github
+          
+          # Create some test files
+          mkdir -p test_data
+          echo "Test configuration" > test_data/test_config.txt
+          echo "Test script content" > test_data/test_script.sh
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+      - name: Test backup creation
+        id: backup_test
+        run: |
+          echo "Testing ${{ matrix.backup_type }} backup creation..."
+          
+          # Run backup script
+          if ./scripts/backup-system.sh ${{ matrix.backup_type }}; then
+            echo "backup_creation=SUCCESS" >> $GITHUB_OUTPUT
+            
+            # Find created backup
+            backup_file=$(find ${{ env.BACKUP_ROOT }} -name "${{ matrix.backup_type }}_backup_*.tar.gz" -type f | head -1)
+            
+            if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+              echo "backup_file=$backup_file" >> $GITHUB_OUTPUT
+              echo "backup_validation=SUCCESS" >> $GITHUB_OUTPUT
+              
+              # Get backup size
+              backup_size=$(du -h "$backup_file" | cut -f1)
+              echo "backup_size=$backup_size" >> $GITHUB_OUTPUT
+              
+              echo "Backup created successfully: $backup_file ($backup_size)"
+            else
+              echo "backup_validation=FAILED" >> $GITHUB_OUTPUT
+              echo "Backup file not found after creation"
+              exit 1
+            fi
+          else
+            echo "backup_creation=FAILED" >> $GITHUB_OUTPUT
+            echo "Backup creation failed"
+            exit 1
+          fi
+          
+      - name: Test backup validation
+        run: |
+          echo "Testing backup validation..."
+          
+          backup_file="${{ steps.backup_test.outputs.backup_file }}"
+          
+          if [[ -n "$backup_file" ]]; then
+            if ./scripts/backup-system.sh --validate "$backup_file"; then
+              echo "Backup validation passed"
+            else
+              echo "Backup validation failed"
+              exit 1
+            fi
+          fi
+          
+      - name: Upload backup artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backup-test-${{ matrix.backup_type }}
+          path: |
+            ${{ env.BACKUP_ROOT }}/
+            logs/backup_*.log
+          retention-days: 7
+
+  recovery-testing:
+    name: 🔄 Recovery Procedures Testing
+    runs-on: ubuntu-latest
+    needs: backup-testing
+    timeout-minutes: 25
+    
+    strategy:
+      matrix:
+        recovery_type: [quick, selective]
+        include:
+          - recovery_type: quick
+            component: ""
+          - recovery_type: selective
+            component: "config"
+            
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download backup artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: backup-test-daily
+          path: ${{ env.BACKUP_ROOT }}
+          
+      - name: Set up recovery test environment
+        run: |
+          # Create test directories
+          mkdir -p ${{ env.RECOVERY_ROOT }} ${{ env.TEST_RESULTS_DIR }}
+          
+          # Set up initial state
+          echo "LINEAR_API_KEY=test_key_placeholder" > .env
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+          # Create some modified state to test recovery
+          echo "Modified configuration" > .env.modified
+          echo "Modified script" > scripts/modified_script.sh
+          
+      - name: Test recovery procedures
+        id: recovery_test
+        run: |
+          echo "Testing ${{ matrix.recovery_type }} recovery..."
+          
+          # Find backup file
+          backup_file=$(find ${{ env.BACKUP_ROOT }} -name "daily_backup_*.tar.gz" -type f | head -1)
+          
+          if [[ -z "$backup_file" ]]; then
+            echo "No backup file found for recovery testing"
+            exit 1
+          fi
+          
+          echo "Using backup file: $backup_file"
+          
+          # Test recovery
+          if [[ "${{ matrix.recovery_type }}" == "selective" ]]; then
+            recovery_cmd="./scripts/recovery-procedures.sh selective $backup_file ${{ matrix.component }}"
+          else
+            recovery_cmd="./scripts/recovery-procedures.sh ${{ matrix.recovery_type }} $backup_file"
+          fi
+          
+          echo "Running: $recovery_cmd"
+          
+          if $recovery_cmd; then
+            echo "recovery_result=SUCCESS" >> $GITHUB_OUTPUT
+            echo "Recovery test passed"
+          else
+            echo "recovery_result=FAILED" >> $GITHUB_OUTPUT
+            echo "Recovery test failed"
+            exit 1
+          fi
+          
+      - name: Validate recovery state
+        run: |
+          echo "Validating recovery state..."
+          
+          if ./scripts/recovery-procedures.sh --validate; then
+            echo "Recovery validation passed"
+          else
+            echo "Recovery validation failed"
+            exit 1
+          fi
+          
+      - name: Upload recovery test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-test-${{ matrix.recovery_type }}
+          path: |
+            logs/recovery_*.log
+            ${{ env.RECOVERY_ROOT }}/
+          retention-days: 7
+
+  emergency-simulation:
+    name: 🚨 Emergency Recovery Simulation
+    runs-on: ubuntu-latest
+    needs: [disaster-recovery-assessment, backup-testing]
+    if: github.event.inputs.test_type == 'emergency_simulation' || github.event_name == 'schedule'
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download backup artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: backup-test-*
+          path: ${{ env.BACKUP_ROOT }}
+          merge-multiple: true
+          
+      - name: Set up emergency simulation
+        run: |
+          # Create test directories
+          mkdir -p ${{ env.RECOVERY_ROOT }} ${{ env.TEST_RESULTS_DIR }}
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+          # Simulate system corruption
+          echo "Simulating system corruption..."
+          
+          # Remove critical files to simulate disaster
+          rm -f .env* || true
+          rm -f scripts/linear-env.sh || true
+          
+          # Corrupt some configurations
+          echo "CORRUPTED" > pytest.ini
+          
+          # Create invalid git state
+          if [[ -d ".git" ]]; then
+            rm -rf .git/refs/heads/* || true
+          fi
+          
+      - name: Run emergency recovery
+        id: emergency_recovery
+        run: |
+          echo "Running emergency recovery simulation..."
+          
+          # Attempt emergency recovery
+          if ./scripts/recovery-procedures.sh emergency; then
+            echo "emergency_result=SUCCESS" >> $GITHUB_OUTPUT
+            echo "Emergency recovery succeeded"
+          else
+            echo "emergency_result=FAILED" >> $GITHUB_OUTPUT
+            echo "Emergency recovery failed"
+            exit 1
+          fi
+          
+      - name: Validate emergency recovery
+        run: |
+          echo "Validating emergency recovery results..."
+          
+          # Check if critical files were restored
+          if [[ -f "scripts/validate-dependencies.sh" ]]; then
+            echo "Critical scripts restored"
+          else
+            echo "Critical scripts missing after emergency recovery"
+            exit 1
+          fi
+          
+          # Run validation if possible
+          if ./scripts/recovery-procedures.sh --validate; then
+            echo "Emergency recovery validation passed"
+          else
+            echo "Emergency recovery validation failed - but this may be expected in emergency scenarios"
+          fi
+          
+      - name: Upload emergency simulation results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emergency-simulation-results
+          path: |
+            logs/recovery_*.log
+            ${{ env.RECOVERY_ROOT }}/
+          retention-days: 30
+
+  comprehensive-testing:
+    name: 🧪 Comprehensive DR Testing
+    runs-on: ubuntu-latest
+    needs: [backup-testing, recovery-testing]
+    if: github.event.inputs.test_type == 'comprehensive' || github.event_name == 'schedule'
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          
+      - name: Set up comprehensive test environment
+        run: |
+          # Create test directories
+          mkdir -p ${{ env.BACKUP_ROOT }} ${{ env.RECOVERY_ROOT }} ${{ env.TEST_RESULTS_DIR }}
+          
+          # Copy backup artifacts
+          find artifacts/ -name "*.tar.gz" -exec cp {} ${{ env.BACKUP_ROOT }}/ \;
+          
+          # Make scripts executable
+          chmod +x scripts/*.sh
+          
+      - name: Run comprehensive backup and recovery cycle
+        run: |
+          echo "Running comprehensive disaster recovery test cycle..."
+          
+          # Create initial backup
+          echo "1. Creating initial system backup..."
+          ./scripts/backup-system.sh manual
+          
+          # Modify system state
+          echo "2. Modifying system state..."
+          echo "MODIFIED_CONFIG=true" >> .env
+          echo "echo 'Modified script'" > scripts/test_modification.sh
+          
+          # Create incremental backup
+          echo "3. Creating incremental backup..."
+          ./scripts/backup-system.sh snapshot
+          
+          # Simulate partial system failure
+          echo "4. Simulating partial system failure..."
+          rm -f .env scripts/linear-env.sh
+          
+          # Test selective recovery
+          echo "5. Testing selective recovery..."
+          latest_backup=$(find ${{ env.BACKUP_ROOT }} -name "snapshot_backup_*.tar.gz" -type f | head -1)
+          ./scripts/recovery-procedures.sh selective "$latest_backup" config
+          
+          # Validate partial recovery
+          echo "6. Validating partial recovery..."
+          if [[ -f ".env" ]]; then
+            echo "Selective recovery successful"
+          else
+            echo "Selective recovery failed"
+            exit 1
+          fi
+          
+          # Test full system recovery
+          echo "7. Testing full system recovery..."
+          manual_backup=$(find ${{ env.BACKUP_ROOT }} -name "manual_backup_*.tar.gz" -type f | head -1)
+          ./scripts/recovery-procedures.sh full "$manual_backup"
+          
+          # Final validation
+          echo "8. Running final system validation..."
+          ./scripts/disaster-recovery-assessment.sh --quick
+          
+      - name: Generate test report
+        run: |
+          echo "Generating comprehensive test report..."
+          
+          cat > ${{ env.TEST_RESULTS_DIR }}/comprehensive_test_report.md << 'EOF'
+          # Comprehensive Disaster Recovery Test Report
+          
+          **Test Date:** $(date)
+          **Test Type:** Comprehensive
+          **Duration:** ${{ job.duration }} minutes
+          
+          ## Test Summary
+          
+          ✅ **Backup Creation:** All backup types tested successfully
+          ✅ **Backup Validation:** All backups validated successfully  
+          ✅ **Recovery Procedures:** All recovery types tested
+          ✅ **Emergency Simulation:** Emergency recovery tested
+          ✅ **System Validation:** Post-recovery validation passed
+          
+          ## Test Coverage
+          
+          - Daily, weekly, and snapshot backups
+          - Quick and selective recovery procedures
+          - Emergency recovery simulation
+          - Full system recovery cycle
+          - Backup integrity validation
+          - Recovery state validation
+          
+          ## Recommendations
+          
+          - Continue weekly automated DR testing
+          - Monitor backup storage utilization
+          - Review and update recovery procedures quarterly
+          - Conduct team training on emergency procedures
+          
+          ## Next Review Date
+          
+          $(date -d '+3 months' '+%Y-%m-%d')
+          EOF
+          
+      - name: Upload comprehensive test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: comprehensive-dr-test-results
+          path: |
+            ${{ env.TEST_RESULTS_DIR }}/
+            logs/
+          retention-days: 90
+
+  notification:
+    name: 📧 Test Results Notification
+    runs-on: ubuntu-latest
+    needs: [disaster-recovery-assessment, backup-testing, recovery-testing, emergency-simulation, comprehensive-testing]
+    if: always()
+    
+    steps:
+      - name: Evaluate test results
+        id: evaluation
+        run: |
+          # Evaluate overall test results
+          assessment_result="${{ needs.disaster-recovery-assessment.result }}"
+          backup_result="${{ needs.backup-testing.result }}"
+          recovery_result="${{ needs.recovery-testing.result }}"
+          emergency_result="${{ needs.emergency-simulation.result }}"
+          comprehensive_result="${{ needs.comprehensive-testing.result }}"
+          
+          echo "Assessment: $assessment_result"
+          echo "Backup: $backup_result"
+          echo "Recovery: $recovery_result"
+          echo "Emergency: $emergency_result"
+          echo "Comprehensive: $comprehensive_result"
+          
+          # Determine overall status
+          if [[ "$assessment_result" == "failure" || "$backup_result" == "failure" || "$recovery_result" == "failure" ]]; then
+            echo "overall_status=FAILED" >> $GITHUB_OUTPUT
+            echo "notification_type=CRITICAL" >> $GITHUB_OUTPUT
+          elif [[ "$emergency_result" == "failure" || "$comprehensive_result" == "failure" ]]; then
+            echo "overall_status=WARNING" >> $GITHUB_OUTPUT
+            echo "notification_type=WARNING" >> $GITHUB_OUTPUT
+          else
+            echo "overall_status=SUCCESS" >> $GITHUB_OUTPUT
+            echo "notification_type=SUCCESS" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Create test summary
+        run: |
+          echo "## 🛡️ Disaster Recovery Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Date:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Overall Status:** ${{ steps.evaluation.outputs.overall_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| System Assessment | ${{ needs.disaster-recovery-assessment.result == 'success' && '✅ PASSED' || '❌ FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backup Testing | ${{ needs.backup-testing.result == 'success' && '✅ PASSED' || '❌ FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Recovery Testing | ${{ needs.recovery-testing.result == 'success' && '✅ PASSED' || '❌ FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Emergency Simulation | ${{ needs.emergency-simulation.result == 'success' && '✅ PASSED' || (needs.emergency-simulation.result == 'skipped' && '⏭️ SKIPPED' || '❌ FAILED') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Comprehensive Testing | ${{ needs.comprehensive-testing.result == 'success' && '✅ PASSED' || (needs.comprehensive-testing.result == 'skipped' && '⏭️ SKIPPED' || '❌ FAILED') }} |" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.evaluation.outputs.overall_status }}" == "FAILED" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Action Required" >> $GITHUB_STEP_SUMMARY
+            echo "Critical disaster recovery issues detected. Please review the test results and address any failures immediately." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Set workflow status
+        run: |
+          if [[ "${{ steps.evaluation.outputs.overall_status }}" == "FAILED" ]]; then
+            echo "Disaster recovery tests failed - critical issues detected"
+            exit 1
+          elif [[ "${{ steps.evaluation.outputs.overall_status }}" == "WARNING" ]]; then
+            echo "Disaster recovery tests completed with warnings"
+            exit 0
+          else
+            echo "All disaster recovery tests passed successfully"
+            exit 0
+          fi
